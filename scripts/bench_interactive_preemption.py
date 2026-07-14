@@ -78,10 +78,17 @@ def _percentile(values: list[float], p: float) -> float:
     return s[f] + (k - f) * (s[c] - s[f])
 
 
-def _prompt_tokens(n: int) -> list[int]:
-    """Generate n tokens (repeating a small vocabulary)."""
-    vocab = list(range(1000, 1100))
-    return [vocab[i % len(vocab)] for i in range(n)]
+def _prompt_text(n_tokens: int) -> str:
+    """Generate roughly n_tokens of text (≈4 chars/token for this model)."""
+    sentence = (
+        "The quick brown fox jumps over the lazy dog while the sun sets "
+        "behind the distant mountains and the river flows calmly through "
+        "the quiet valley where birds sing their evening songs. "
+    )
+    # ~4 chars per token heuristic
+    target_chars = n_tokens * 4
+    repeats = max(1, target_chars // len(sentence))
+    return sentence * repeats
 
 
 # ---------------------------------------------------------------------------
@@ -99,9 +106,28 @@ def get_model_id(base_url: str, model: str) -> str:
     r = requests.get(f"{base_url}/v1/models", timeout=10)
     r.raise_for_status()
     models = r.json().get("data", [])
+    ml = model.lower()
+    # Exact match
     for m in models:
         mid = m.get("id", "")
-        if model.lower() in mid.lower():
+        if mid.lower() == ml:
+            return mid
+    # Substring match
+    for m in models:
+        mid = m.get("id", "")
+        mll = mid.lower()
+        if ml in mll or mll in ml:
+            return mid
+    # Token-based match: split on non-alphanumeric, check if all query
+    # tokens appear (in any order) within the model id tokens.
+    import re
+    def tokenize(s: str) -> list[str]:
+        return [t for t in re.split(r"[^a-z0-9]", s.lower()) if t]
+    qt = tokenize(model)
+    for m in models:
+        mid = m.get("id", "")
+        mtt = tokenize(mid)
+        if all(t in mtt for t in qt):
             return mid
     return model
 
@@ -109,7 +135,7 @@ def get_model_id(base_url: str, model: str) -> str:
 def fire_request(
     base_url: str,
     model: str,
-    prompt_tokens: list[int],
+    content: str,
     priority: int,
     max_tokens: int = 64,
     stream: bool = True,
@@ -117,8 +143,9 @@ def fire_request(
     """Send a single request and parse metrics from the final SSE chunk."""
     payload: dict[str, Any] = {
         "model": model,
-        "messages": [{"role": "user", "content": "Hello"}],
+        "messages": [{"role": "user", "content": content}],
         "max_tokens": max_tokens,
+        "priority": priority,
         "stream": stream,
         "stream_options": {"include_usage": True},
     }
@@ -145,11 +172,9 @@ def _fire_stream(
     base_url: str, payload: dict, priority: int, t_start: float
 ) -> RequestMetrics:
     """Fire a streaming request, parse TTFT and usage from SSE."""
-    headers = {"X-Request-Priority": str(priority)}
     r = requests.post(
         f"{base_url}/v1/chat/completions",
         json=payload,
-        headers=headers,
         stream=True,
         timeout=120,
     )
@@ -253,7 +278,7 @@ def run_bench(
     print(f"  resolved model: {model_id}")
 
     # Build prompts
-    bg_prompt = _prompt_tokens(bg_prompt_tokens)
+    bg_prompt = _prompt_text(bg_prompt_tokens)
 
     result = BenchResult(run_label=label, background_count=bg_count, interactive_count=interactive_runs)
 
@@ -271,14 +296,25 @@ def run_bench(
     # Brief pause so background requests start prefilling
     time.sleep(0.5)
 
-    # Phase 2: fire interactive requests
+    # Phase 2: fire interactive requests concurrently (like background)
     print(f"  Firing {interactive_runs} interactive requests (priority=0)...")
     interactive_metrics: list[RequestMetrics] = []
-    turn_prompt = _prompt_tokens(256)
+    turn_prompt = _prompt_text(256)
 
-    for run_i in range(interactive_runs):
-        for turn in range(turns):
-            m = fire_request(base_url, model_id, turn_prompt, priority=0, max_tokens=64)
+    interactive_futures: list = []
+    future_labels: dict = {}
+    with ThreadPoolExecutor(max_workers=max(1, interactive_runs * turns)) as pool:
+        for run_i in range(interactive_runs):
+            for turn in range(turns):
+                fut = pool.submit(
+                    fire_request, base_url, model_id, turn_prompt, priority=0, max_tokens=64
+                )
+                interactive_futures.append(fut)
+                future_labels[fut] = (run_i, turn)
+        # Collect as they complete
+        for fut in as_completed(interactive_futures):
+            run_i, turn = future_labels[fut]
+            m = fut.result()
             m.request_id = f"interactive-{run_i}-turn{turn}"
             interactive_metrics.append(m)
             if m.time_to_first_token is not None:
@@ -365,7 +401,7 @@ def run_assertions(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark interactive preemption")
     parser.add_argument("--base-url", default="http://127.0.0.1:18200")
-    parser.add_argument("--model", default="qwen3.6-35b-a3b-4bit")
+    parser.add_argument("--model", default="Qwen3.6-35B-A3B-Heretic-4bit")
     parser.add_argument("--background", type=int, default=8)
     parser.add_argument("--background-prompt-tokens", type=int, default=16384)
     parser.add_argument("--interactive-runs", type=int, default=20)
