@@ -4333,18 +4333,19 @@ class Scheduler:
     def _target_background_decode_rows(self) -> int:
         """Calculate how many background decode rows to keep resident.
 
-        At floor 0.5, one interactive row permits one background row.
-        At floor 1.0, no background rows are allowed.
-        At floor 0.0, all background rows are kept (no floor).
+        Keys off slot pressure, not interactive count: background may occupy
+        at most (max_num_seqs - active_interactive) rows, scaled by floor.
+        At floor 1.0, background gets 0 rows whenever interactive is active
+        (full reservation). At floor 0.5, background gets half the remaining
+        slots. At floor 0.0, all background rows are kept (no floor).
         """
         floor = self.config.interactive_decode_floor
         interactive = self._active_interactive_decode_count()
         if floor <= 0.0 or interactive == 0:
             return self._active_background_decode_count()
-        # floor ∈ (0, 1]: background_rows = interactive * (1 - floor) / floor
-        import math
-
-        return max(0, math.floor(interactive * (1.0 - floor) / floor))
+        max_slots = self.config.max_num_seqs
+        available = max(0, max_slots - interactive)
+        return max(0, int(available * floor))
 
     def _suspend_decode_request(self, request_id: str) -> bool:
         """Suspend a background decode request, preserving its KV cache.

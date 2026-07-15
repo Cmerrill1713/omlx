@@ -90,14 +90,14 @@ class TestTargetBackgroundDecodeRows:
         # floor=0 means no limit
         assert s._target_background_decode_rows() == 2
 
-    def test_floor_one_removes_all_with_interactive(self):
+    def test_floor_one_full_reservation_with_interactive(self):
         s = _make_scheduler(decode_floor=1.0)
         interactive = _make_request("chat1", priority=0)
         bg1 = _make_request("bg1", priority=10)
         _enqueue_running(s, interactive, uid=1)
         _enqueue_running(s, bg1, uid=2)
-        # floor=1.0, 1 interactive → floor((1*0)/1) = 0
-        assert s._target_background_decode_rows() == 0
+        # floor=1.0, 1 interactive, max_num_seqs=8 → (8-1)*1.0 = 7
+        assert s._target_background_decode_rows() == 7
 
     def test_floor_one_keeps_all_when_no_interactive(self):
         s = _make_scheduler(decode_floor=1.0)
@@ -106,7 +106,7 @@ class TestTargetBackgroundDecodeRows:
         # floor=1.0, 0 interactive → return current count (1)
         assert s._target_background_decode_rows() == 1
 
-    def test_floor_half_one_per_interactive(self):
+    def test_floor_half_reserves_half_remaining(self):
         s = _make_scheduler(decode_floor=0.5)
         interactive = _make_request("chat1", priority=0)
         bg1 = _make_request("bg1", priority=10)
@@ -114,10 +114,10 @@ class TestTargetBackgroundDecodeRows:
         _enqueue_running(s, interactive, uid=1)
         _enqueue_running(s, bg1, uid=2)
         _enqueue_running(s, bg2, uid=3)
-        # 1 interactive, floor=0.5 → floor((1*(1-0.5))/0.5) = floor(1) = 1
-        assert s._target_background_decode_rows() == 1
+        # 1 interactive, floor=0.5, max_num_seqs=8 → (8-1)*0.5 = 3
+        assert s._target_background_decode_rows() == 3
 
-    def test_floor_quarter_two_per_interactive(self):
+    def test_floor_quarter_reserves_quarter_remaining(self):
         s = _make_scheduler(decode_floor=0.25)
         interactive = _make_request("chat1", priority=0)
         bg1 = _make_request("bg1", priority=10)
@@ -127,8 +127,8 @@ class TestTargetBackgroundDecodeRows:
         _enqueue_running(s, bg1, uid=2)
         _enqueue_running(s, bg2, uid=3)
         _enqueue_running(s, bg3, uid=4)
-        # 1 interactive, floor=0.25 → floor((1*0.75)/0.25) = floor(3) = 3
-        assert s._target_background_decode_rows() == 3
+        # 1 interactive, floor=0.25, max_num_seqs=8 → (8-1)*0.25 = 1
+        assert s._target_background_decode_rows() == 1
 
     def test_no_interactive_returns_current(self):
         s = _make_scheduler(decode_floor=0.5)
@@ -305,22 +305,24 @@ class TestApplyDecodeFloor:
 
     def test_suspend_excess_when_interactive_active(self):
         s = _make_scheduler(decode_floor=0.5)
-        interactive = _make_request("chat1", priority=0)
+        # 7 interactive fill 7 of 8 slots; floor=0.5 → target=(8-7)*0.5=0
+        for i in range(7):
+            _enqueue_running(s, _make_request(f"chat{i}", priority=0), uid=10 + i)
         bg1 = _make_request("bg1", priority=10)
         bg2 = _make_request("bg2", priority=10)
-        _enqueue_running(s, interactive, uid=1)
         _enqueue_running(s, bg1, uid=2)
         _enqueue_running(s, bg2, uid=3)
 
         fake_cache = [MagicMock()]
         s.batch_generator.remove.side_effect = [
-            {2: (fake_cache, [1])},  # suspend bg1
+            {2: (fake_cache, [1])},  # suspend bg1 (oldest uid)
+            {3: (fake_cache, [1])},  # suspend bg2
         ]
 
         s._apply_decode_floor()
-        # 1 interactive, floor=0.5 → target=1 bg, 2 active → 1 excess
-        assert s._decode_suspensions == 1
-        assert "bg1" in s._suspended_decodes or "bg2" in s._suspended_decodes
+        # 7 interactive, floor=0.5 → target=0 bg, 2 active → 2 excess
+        assert s._decode_suspensions == 2
+        assert "bg1" in s._suspended_decodes and "bg2" in s._suspended_decodes
 
     def test_within_budget_no_suspend(self):
         s = _make_scheduler(decode_floor=0.5)
